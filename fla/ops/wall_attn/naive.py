@@ -25,7 +25,8 @@ def naive_wall_attn(
     cu_seqlens: torch.LongTensor | None = None,
     sink_bias: torch.Tensor | None = None,
     g_scalar: torch.Tensor | None = None,
-) -> torch.Tensor:
+    return_lse: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     r"""Eager Wall forward (exact logits): per pair :math:`(i,j)`,
     :math:`s_{ij} = \sum_n q_{in} k_{jn} \exp_2(P_{in}-P_{jn}) \cdot \mathrm{scale}\cdot\mathrm{RCP\_LN2}`
     with :math:`P` the prefix cumsum of ``g`` in log_2 (same as the Triton path)."""
@@ -78,4 +79,7 @@ def naive_wall_attn(
     w = p / den.unsqueeze(-1)
     v_h = v.repeat_interleave(G, dim=2).permute(0, 2, 1, 3).float().contiguous()
     o = torch.matmul(w, v_h).transpose(1, 2).contiguous()
+    if return_lse:
+        lse = ((m_stable.squeeze(-1) + torch.log2(den)) / RCP_LN2).transpose(1, 2).contiguous()
+        return o, lse
     return o
