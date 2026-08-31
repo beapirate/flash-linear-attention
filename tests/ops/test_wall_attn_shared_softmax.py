@@ -10,7 +10,7 @@ import os
 import pytest
 import torch
 
-from fla.ops.wall_attn import combine_wall_attn_outputs, parallel_wall_attn
+from fla.ops.wall_attn import bidirectional_wall_attn, parallel_wall_attn
 from fla.utils import assert_close, device
 
 os.environ['TRITON_F32_DEFAULT'] = 'ieee'
@@ -57,6 +57,18 @@ def _inputs(T, H, K, V):
     return q, k, v, g
 
 
+def _reverse_reference(x, cu_seqlens=None):
+    if cu_seqlens is None:
+        return x.flip(1)
+    return torch.cat(
+        [
+            x[:, int(cu_seqlens[n]):int(cu_seqlens[n + 1])].flip(1)
+            for n in range(cu_seqlens.numel() - 1)
+        ],
+        dim=1,
+    )
+
+
 @pytest.mark.parametrize('varlen', [False, True])
 def test_parallel_lse_forward_and_backward(varlen):
     torch.manual_seed(42)
@@ -81,21 +93,33 @@ def test_parallel_lse_forward_and_backward(varlen):
         assert_close(name, reference, actual, RTOL)
 
 
-def test_shared_softmax_matches_concatenated_reference():
+@pytest.mark.parametrize('varlen', [False, True])
+def test_bidirectional_shared_softmax_matches_reference(varlen):
     torch.manual_seed(43)
     T, H, K, V = 13, 2, 16, 12
     scale = K**-0.5
+    cu_seqlens = torch.tensor([0, 5, T], dtype=torch.long, device=device) if varlen else None
     actual_a = _inputs(T, H, K, V)
     actual_b = _inputs(T, H, K, V)
     reference_a = tuple(x.detach().clone().requires_grad_(True) for x in actual_a)
     reference_b = tuple(x.detach().clone().requires_grad_(True) for x in actual_b)
 
-    output_a, lse_a = parallel_wall_attn(*actual_a, scale=scale, return_lse=True)
-    output_b, lse_b = parallel_wall_attn(*actual_b, scale=scale, return_lse=True)
-    contribution_a, contribution_b, joint_lse = combine_wall_attn_outputs(output_a, lse_a, output_b, lse_b)
+    contribution_a, contribution_b, joint_lse = bidirectional_wall_attn(
+        *actual_a,
+        *actual_b,
+        scale=scale,
+        cu_seqlens=cu_seqlens,
+    )
 
-    output_a_ref, lse_a_ref = _reference_wall(*reference_a, scale=scale)
-    output_b_ref, lse_b_ref = _reference_wall(*reference_b, scale=scale)
+    output_a_ref, lse_a_ref = _reference_wall(*reference_a, scale=scale, cu_seqlens=cu_seqlens)
+    reference_b_reversed = tuple(_reverse_reference(x, cu_seqlens) for x in reference_b)
+    output_b_ref_reversed, lse_b_ref_reversed = _reference_wall(
+        *reference_b_reversed,
+        scale=scale,
+        cu_seqlens=cu_seqlens,
+    )
+    output_b_ref = _reverse_reference(output_b_ref_reversed, cu_seqlens)
+    lse_b_ref = _reverse_reference(lse_b_ref_reversed, cu_seqlens)
     joint_lse_ref = torch.logaddexp(lse_a_ref, lse_b_ref)
     mass_a_ref = torch.exp(lse_a_ref - joint_lse_ref).unsqueeze(-1)
     mass_b_ref = torch.exp(lse_b_ref - joint_lse_ref).unsqueeze(-1)
