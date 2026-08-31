@@ -123,7 +123,7 @@ def parallel_wall_attn_fwd_kernel(
     IS_VARLEN: tl.constexpr,
     USE_SCALAR_G: tl.constexpr,
 ):
-    i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1).to(tl.int64), tl.program_id(2).to(tl.int64)
+    i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1).to(tl.int64), tl.program_id(2)
     i_b, i_hq = i_bh // HQ, i_bh % HQ
     i_h = i_hq // G
 
@@ -300,7 +300,7 @@ def parallel_wall_attn_bwd_kernel_dq(
     IS_VARLEN: tl.constexpr,
     USE_SCALAR_G: tl.constexpr,
 ):
-    i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1).to(tl.int64), tl.program_id(2).to(tl.int64)
+    i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1).to(tl.int64), tl.program_id(2)
     i_b, i_hq = i_bh // HQ, i_bh % HQ
     i_h = i_hq // G
 
@@ -491,7 +491,7 @@ def parallel_wall_attn_bwd_kernel_dkv(
     USE_SCALAR_G: tl.constexpr,
     DIAG_BF16: tl.constexpr,
 ):
-    i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1).to(tl.int64), tl.program_id(2).to(tl.int64)
+    i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1).to(tl.int64), tl.program_id(2)
     i_b, i_hq = i_bh // HQ, i_bh % HQ
     i_h = i_hq // G
 
@@ -769,6 +769,7 @@ def parallel_wall_attn_bwd(
     g_cumsum: torch.Tensor,
     lse: torch.Tensor,
     do: torch.Tensor,
+    dlse: torch.Tensor | None = None,
     sink_bias: torch.Tensor | None = None,
     scale: float | None = None,
     g_scalar_cumsum: torch.Tensor | None = None,
@@ -815,6 +816,12 @@ def parallel_wall_attn_bwd(
             return (NV, triton.cdiv(T, meta['BT']), B * HQ)
 
     delta = parallel_wall_attn_bwd_preprocess(o, do, BV)
+    if dlse is not None:
+        if dlse.shape != lse.shape:
+            raise ValueError(f"`dlse` must be [B, T, HQ] matching `lse`; got {dlse.shape} vs {lse.shape}")
+        # score gradients from each value tile are reduced below, so distribute the
+        # log-normalizer contribution evenly to avoid applying it NV times.
+        delta.sub_(dlse.float().unsqueeze(0) / NV)
 
     partial_dtype = k.dtype if NV == 1 and H == HQ else torch.float
     dq = torch.empty(NV, B, T, HQ, K, dtype=partial_dtype, device=q.device)
@@ -941,7 +948,20 @@ class WallParallelAttentionFunction(torch.autograd.Function):
     @staticmethod
     @contiguous
     @autocast_custom_fwd
-    def forward(ctx, q, k, v, g, sink_bias, scale, window_size, cu_seqlens, g_scalar=None, chunk_indices=None):
+    def forward(
+        ctx,
+        q,
+        k,
+        v,
+        g,
+        sink_bias,
+        scale,
+        window_size,
+        cu_seqlens,
+        g_scalar=None,
+        chunk_indices=None,
+        return_lse=False,
+    ):
         if g.shape[-1] != q.shape[-1] or g.shape[2] != q.shape[2]:
             raise ValueError(
                 f"`g` must be [B, T, HQ, K] with same HQ and K as `q`; got {g.shape} vs q {q.shape}"
@@ -994,12 +1014,15 @@ class WallParallelAttentionFunction(torch.autograd.Function):
         ctx.window_size = window_size
         ctx.cu_seqlens = cu_seqlens
         ctx.has_scalar_g = g_scalar is not None
+        ctx.return_lse = return_lse
+        if return_lse:
+            return o.to(q.dtype), lse / RCP_LN2
         return o.to(q.dtype)
 
     @staticmethod
     @contiguous
     @autocast_custom_bwd
-    def backward(ctx, do):
+    def backward(ctx, do, dlse=None):
         q, k, v, o, P, lse, sink_bias_scaled, c_or_empty = ctx.saved_tensors
         c = c_or_empty if ctx.has_scalar_g else None
 
@@ -1014,6 +1037,7 @@ class WallParallelAttentionFunction(torch.autograd.Function):
             g_cumsum=P,
             lse=lse,
             do=do,
+            dlse=dlse if ctx.return_lse else None,
             sink_bias=sink_bias_scaled,
             scale=ctx.scale,
             g_scalar_cumsum=c,
@@ -1043,7 +1067,41 @@ class WallParallelAttentionFunction(torch.autograd.Function):
         else:
             dg_scalar = None
 
-        return dq.to(q), dk.to(k), dv.to(v), dg, dsink_bias, None, None, None, dg_scalar, None
+        return dq.to(q), dk.to(k), dv.to(v), dg, dsink_bias, None, None, None, dg_scalar, None, None
+
+
+def combine_wall_attn_outputs(
+    output_a: torch.Tensor,
+    lse_a: torch.Tensor,
+    output_b: torch.Tensor,
+    lse_b: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    r"""Combine two normalized Wall branches under one exact shared softmax.
+
+    Args:
+        output_a (torch.Tensor):
+            First branch output of shape ``[..., V_a]``.
+        lse_a (torch.Tensor):
+            Natural-log normalizer for the first branch of shape ``output_a.shape[:-1]``.
+        output_b (torch.Tensor):
+            Second branch output of shape ``[..., V_b]``.
+        lse_b (torch.Tensor):
+            Natural-log normalizer for the second branch of shape ``output_b.shape[:-1]``.
+
+    Returns:
+        The two shared-normalized branch contributions and their joint natural-log normalizer.
+    """
+    if output_a.shape[:-1] != output_b.shape[:-1]:
+        raise ValueError("Wall branch outputs must have matching batch, sequence, and head dimensions")
+    if lse_a.shape != output_a.shape[:-1] or lse_b.shape != output_b.shape[:-1]:
+        raise ValueError("Each Wall branch LSE must match its output shape excluding the value dimension")
+
+    joint_lse = torch.logaddexp(lse_a.float(), lse_b.float())
+    mass_a = torch.exp(lse_a.float() - joint_lse).unsqueeze(-1)
+    mass_b = torch.exp(lse_b.float() - joint_lse).unsqueeze(-1)
+    contribution_a = (output_a.float() * mass_a).to(output_a.dtype)
+    contribution_b = (output_b.float() * mass_b).to(output_b.dtype)
+    return contribution_a, contribution_b, joint_lse
 
 
 def parallel_wall_attn(
@@ -1057,7 +1115,8 @@ def parallel_wall_attn(
     scale: float | None = None,
     window_size: int | None = None,
     cu_seqlens: torch.LongTensor | None = None,
-) -> torch.Tensor:
+    return_lse: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     r"""Wall parallel attention (training / prefill forward + backward).
 
     Scores use a per-channel multiplicative decay: with :math:`P = \mathrm{cumsum}(g)`
@@ -1084,9 +1143,12 @@ def parallel_wall_attn(
         cu_seqlens (torch.LongTensor, Optional):
             Cumulative seqlens of shape ``[N + 1]`` for varlen packing
             (requires ``B == 1``). Default: `None`.
+        return_lse (bool, Optional):
+            Whether to also return the differentiable natural-log softmax normalizer. Default: `False`.
 
     Returns:
-        Attention output of shape ``[B, T, HQ, V]``.
+        Attention output of shape ``[B, T, HQ, V]``. If ``return_lse=True``, also returns the natural-log
+        softmax normalizer of shape ``[B, T, HQ]``.
     """
     if scale is None:
         scale = k.shape[-1] ** -0.5
@@ -1097,5 +1159,5 @@ def parallel_wall_attn(
     if sink_bias is not None and sink_bias.shape != (q.shape[2],):
         raise ValueError(f"`sink_bias` must be [HQ]; got {sink_bias.shape}")
     return WallParallelAttentionFunction.apply(
-        q, k, v, g, sink_bias, scale, window_size, cu_seqlens, g_scalar, None
+        q, k, v, g, sink_bias, scale, window_size, cu_seqlens, g_scalar, None, return_lse
     )
