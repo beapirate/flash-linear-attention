@@ -9,9 +9,14 @@
 
 from .decode import build_wall_kv_cache, parallel_wall_attn_decode
 from .naive import naive_wall_attn
-from .parallel import combine_wall_attn_outputs, parallel_wall_attn
+from .parallel import (
+    bidirectional_wall_attn,
+    combine_wall_attn_outputs,
+    parallel_wall_attn,
+)
 
 __all__ = [
+    'bidirectional_wall_attn',
     'build_wall_kv_cache',
     'combine_wall_attn_outputs',
     'naive_wall_attn',
