@@ -1104,6 +1104,79 @@ def combine_wall_attn_outputs(
     return contribution_a, contribution_b, joint_lse
 
 
+def _reverse_wall_sequences(x: torch.Tensor, cu_seqlens: torch.LongTensor | None) -> torch.Tensor:
+    if cu_seqlens is None:
+        return x.flip(1)
+    lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).to(device=x.device)
+    starts = torch.repeat_interleave(cu_seqlens[:-1].to(device=x.device), lengths)
+    ends = torch.repeat_interleave(cu_seqlens[1:].to(device=x.device), lengths)
+    positions = torch.arange(x.shape[1], device=x.device)
+    reverse_index = starts + ends - 1 - positions
+    return x.index_select(1, reverse_index)
+
+
+def bidirectional_wall_attn(
+    q_past: torch.Tensor,
+    k_past: torch.Tensor,
+    v_past: torch.Tensor,
+    g_past: torch.Tensor,
+    q_future: torch.Tensor,
+    k_future: torch.Tensor,
+    v_future: torch.Tensor,
+    g_future: torch.Tensor,
+    *,
+    g_scalar_past: torch.Tensor | None = None,
+    g_scalar_future: torch.Tensor | None = None,
+    sink_bias_past: torch.Tensor | None = None,
+    sink_bias_future: torch.Tensor | None = None,
+    scale: float | None = None,
+    window_size: int | None = None,
+    cu_seqlens: torch.LongTensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    r"""Apply paired past/future Wall attention with one shared softmax per head.
+
+    The future branch is reversed independently within every packed sequence. Both causal branches include their diagonal.
+
+    Returns:
+        Shared-normalized past and future contributions, followed by their joint natural-log normalizer.
+    """
+    output_past, lse_past = parallel_wall_attn(
+        q_past,
+        k_past,
+        v_past,
+        g_past,
+        g_scalar=g_scalar_past,
+        sink_bias=sink_bias_past,
+        scale=scale,
+        window_size=window_size,
+        cu_seqlens=cu_seqlens,
+        return_lse=True,
+    )
+
+    q_future_reversed = _reverse_wall_sequences(q_future, cu_seqlens)
+    k_future_reversed = _reverse_wall_sequences(k_future, cu_seqlens)
+    v_future_reversed = _reverse_wall_sequences(v_future, cu_seqlens)
+    g_future_reversed = _reverse_wall_sequences(g_future, cu_seqlens)
+    g_scalar_future_reversed = (
+        _reverse_wall_sequences(g_scalar_future, cu_seqlens) if g_scalar_future is not None else None
+    )
+    output_future_reversed, lse_future_reversed = parallel_wall_attn(
+        q_future_reversed,
+        k_future_reversed,
+        v_future_reversed,
+        g_future_reversed,
+        g_scalar=g_scalar_future_reversed,
+        sink_bias=sink_bias_future,
+        scale=scale,
+        window_size=window_size,
+        cu_seqlens=cu_seqlens,
+        return_lse=True,
+    )
+    output_future = _reverse_wall_sequences(output_future_reversed, cu_seqlens)
+    lse_future = _reverse_wall_sequences(lse_future_reversed, cu_seqlens)
+    return combine_wall_attn_outputs(output_past, lse_past, output_future, lse_future)
+
+
 def parallel_wall_attn(
     q: torch.Tensor,
     k: torch.Tensor,
