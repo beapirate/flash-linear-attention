@@ -89,6 +89,7 @@ def parallel_wall_attn_bwd_kernel_preprocess(
 @triton.heuristics({
     'USE_SINK_BIAS': lambda args: args['sink_bias'] is not None,
     'USE_WINDOW': lambda args: args['W'] is not None,
+    'USE_POSITION_WINDOW': lambda args: args['position_ids'] is not None,
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
     'USE_SCALAR_G': lambda args: args['g_scalar_cumsum'] is not None,
 })
@@ -101,6 +102,7 @@ def parallel_wall_attn_fwd_kernel(
     g_cumsum,
     g_scalar_cumsum,
     sink_bias,
+    position_ids,
     lse,
     scale,
     cu_seqlens,
@@ -108,6 +110,7 @@ def parallel_wall_attn_fwd_kernel(
     T,
     T_BUCKET,
     W: tl.constexpr,
+    R: tl.constexpr,
     B: tl.constexpr,
     H: tl.constexpr,
     HQ: tl.constexpr,
@@ -120,6 +123,7 @@ def parallel_wall_attn_fwd_kernel(
     BV: tl.constexpr,
     USE_SINK_BIAS: tl.constexpr,
     USE_WINDOW: tl.constexpr,
+    USE_POSITION_WINDOW: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     USE_SCALAR_G: tl.constexpr,
 ):
@@ -192,6 +196,11 @@ def parallel_wall_attn_fwd_kernel(
             b_s += b_cq[:, None] - b_ck[None, :]
         if USE_WINDOW:
             b_s = tl.where((o_q[:, None] - o_k[None, :] < W) & m_k[None, :], b_s, float('-inf'))
+        if USE_POSITION_WINDOW:
+            b_position_q = tl.load(position_ids + i_b * T + o_q, mask=m_q, other=0)
+            b_position_k = tl.load(position_ids + i_b * T + o_k, mask=m_k, other=0)
+            b_position_delta = tl.abs(b_position_q[:, None] - b_position_k[None, :])
+            b_s = tl.where(b_position_delta <= R, b_s, float('-inf'))
 
         b_m, b_mp = tl.maximum(b_m, tl.max(b_s, 1)), b_m
         b_mw = tl.where(b_m == float('-inf'), 0., b_m)
@@ -236,6 +245,11 @@ def parallel_wall_attn_fwd_kernel(
         m_s = (o_q[:, None] >= o_k[None, :]) & m_k[None, :]
         if USE_WINDOW:
             m_s = m_s & (o_q[:, None] - o_k[None, :] < W)
+        if USE_POSITION_WINDOW:
+            b_position_q = tl.load(position_ids + i_b * T + o_q, mask=m_q, other=0)
+            b_position_k = tl.load(position_ids + i_b * T + o_k, mask=m_k, other=0)
+            b_position_delta = tl.abs(b_position_q[:, None] - b_position_k[None, :])
+            m_s = m_s & (b_position_delta <= R)
         b_s = tl.where(m_s, b_s, float('-inf'))
 
         b_m, b_mp = tl.maximum(b_m, tl.max(b_s, 1)), b_m
@@ -264,6 +278,7 @@ def parallel_wall_attn_fwd_kernel(
 )
 @triton.heuristics({
     'USE_WINDOW': lambda args: args['W'] is not None,
+    'USE_POSITION_WINDOW': lambda args: args['position_ids'] is not None,
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
     'USE_SCALAR_G': lambda args: args['g_scalar_cumsum'] is not None,
 })
@@ -280,12 +295,14 @@ def parallel_wall_attn_bwd_kernel_dq(
     dq,
     dg_cumsum,
     dg_scalar_cumsum,
+    position_ids,
     scale,
     cu_seqlens,
     chunk_indices,
     T,
     T_BUCKET,
     W: tl.constexpr,
+    R: tl.constexpr,
     B: tl.constexpr,
     H: tl.constexpr,
     HQ: tl.constexpr,
@@ -297,6 +314,7 @@ def parallel_wall_attn_bwd_kernel_dq(
     BK: tl.constexpr,
     BV: tl.constexpr,
     USE_WINDOW: tl.constexpr,
+    USE_POSITION_WINDOW: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     USE_SCALAR_G: tl.constexpr,
 ):
@@ -375,6 +393,11 @@ def parallel_wall_attn_bwd_kernel_dq(
             b_s += b_cq[:, None] - b_ck[None, :]
         if USE_WINDOW:
             b_s = tl.where((o_q[:, None] - o_k[None, :] < W) & m_k[None, :], b_s, float('-inf'))
+        if USE_POSITION_WINDOW:
+            b_position_q = tl.load(position_ids + i_b * T + o_q, mask=m_q, other=0)
+            b_position_k = tl.load(position_ids + i_b * T + o_k, mask=m_k, other=0)
+            b_position_delta = tl.abs(b_position_q[:, None] - b_position_k[None, :])
+            b_s = tl.where(b_position_delta <= R, b_s, float('-inf'))
         b_p = exp2(b_s - b_lse[:, None])
         b_dp = tl.dot(b_do, b_v)
         b_ds = b_p * (b_dp.to(tl.float32) - b_delta[:, None])
@@ -416,13 +439,15 @@ def parallel_wall_attn_bwd_kernel_dq(
             b_ck = tl.load(g_scalar_cumsum + (bos + o_k) * HQ + i_hq, mask=m_k, other=0).to(tl.float32)
             b_s += b_cq[:, None] - b_ck[None, :]
 
+        m_s = (o_q[:, None] >= o_k[None, :]) & m_k[None, :]
         if USE_WINDOW:
-            b_p = tl.where(
-                (o_q[:, None] >= o_k[None, :]) & (o_q[:, None] - o_k[None, :] < W) & m_k[None, :],
-                exp2(b_s - b_lse[:, None]), 0
-            )
-        else:
-            b_p = tl.where((o_q[:, None] >= o_k[None, :]) & m_k[None, :], exp2(b_s - b_lse[:, None]), 0)
+            m_s = m_s & (o_q[:, None] - o_k[None, :] < W)
+        if USE_POSITION_WINDOW:
+            b_position_q = tl.load(position_ids + i_b * T + o_q, mask=m_q, other=0)
+            b_position_k = tl.load(position_ids + i_b * T + o_k, mask=m_k, other=0)
+            b_position_delta = tl.abs(b_position_q[:, None] - b_position_k[None, :])
+            m_s = m_s & (b_position_delta <= R)
+        b_p = tl.where(m_s, exp2(b_s - b_lse[:, None]), 0)
 
         b_dp = tl.dot(b_do, b_v)
         b_ds = b_p * (b_dp.to(tl.float32) - b_delta[:, None])
@@ -453,6 +478,7 @@ def parallel_wall_attn_bwd_kernel_dq(
 )
 @triton.heuristics({
     'USE_WINDOW': lambda args: args['W'] is not None,
+    'USE_POSITION_WINDOW': lambda args: args['position_ids'] is not None,
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
     'USE_SCALAR_G': lambda args: args['g_scalar_cumsum'] is not None,
 })
@@ -470,12 +496,14 @@ def parallel_wall_attn_bwd_kernel_dkv(
     dv,
     dg_cumsum,
     dg_scalar_cumsum,
+    position_ids,
     cu_seqlens,
     chunk_indices,
     scale,
     T,
     T_BUCKET,
     W: tl.constexpr,
+    R: tl.constexpr,
     B: tl.constexpr,
     H: tl.constexpr,
     HQ: tl.constexpr,
@@ -487,6 +515,7 @@ def parallel_wall_attn_bwd_kernel_dkv(
     BK: tl.constexpr,
     BV: tl.constexpr,
     USE_WINDOW: tl.constexpr,
+    USE_POSITION_WINDOW: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     USE_SCALAR_G: tl.constexpr,
     DIAG_BF16: tl.constexpr,
@@ -575,13 +604,15 @@ def parallel_wall_attn_bwd_kernel_dkv(
         if USE_SCALAR_G:
             b_cq = tl.load(g_scalar_cumsum + (bos + o_q) * HQ + i_hq, mask=m_q, other=0).to(tl.float32)
             b_s += b_cq[None, :] - b_ck[:, None]
+        m_s = (o_k[:, None] <= o_q[None, :]) & m_q[None, :]
         if USE_WINDOW:
-            b_p = tl.where(
-                (o_k[:, None] <= o_q[None, :]) & (o_q[None, :] - o_k[:, None] < W) & m_q[None, :],
-                exp2(b_s - b_lse[None, :]), 0
-            )
-        else:
-            b_p = tl.where((o_k[:, None] <= o_q[None, :]) & m_q[None, :], exp2(b_s - b_lse[None, :]), 0)
+            m_s = m_s & (o_q[None, :] - o_k[:, None] < W)
+        if USE_POSITION_WINDOW:
+            b_position_q = tl.load(position_ids + i_b * T + o_q, mask=m_q, other=0)
+            b_position_k = tl.load(position_ids + i_b * T + o_k, mask=m_k, other=0)
+            b_position_delta = tl.abs(b_position_k[:, None] - b_position_q[None, :])
+            m_s = m_s & (b_position_delta <= R)
+        b_p = tl.where(m_s, exp2(b_s - b_lse[None, :]), 0)
         b_dv += tl.dot(b_p.to(b_do.dtype), b_do)
         b_dp = tl.dot(b_v, tl.trans(b_do))
         b_ds = b_p * (b_dp - b_delta[None, :])
@@ -622,10 +653,15 @@ def parallel_wall_attn_bwd_kernel_dkv(
         if USE_SCALAR_G:
             b_cq = tl.load(g_scalar_cumsum + (bos + o_q) * HQ + i_hq, mask=m_q, other=0).to(tl.float32)
             b_s += b_cq[None, :] - b_ck[:, None]
+        m_s = m_q[None, :]
         if USE_WINDOW:
-            b_p = tl.where((o_q[None, :] - o_k[:, None] < W) & m_q[None, :], exp2(b_s - b_lse[None, :]), 0)
-        else:
-            b_p = tl.where(m_q[None, :], exp2(b_s - b_lse[None, :]), 0)
+            m_s = m_s & (o_q[None, :] - o_k[:, None] < W)
+        if USE_POSITION_WINDOW:
+            b_position_q = tl.load(position_ids + i_b * T + o_q, mask=m_q, other=0)
+            b_position_k = tl.load(position_ids + i_b * T + o_k, mask=m_k, other=0)
+            b_position_delta = tl.abs(b_position_k[:, None] - b_position_q[None, :])
+            m_s = m_s & (b_position_delta <= R)
+        b_p = tl.where(m_s, exp2(b_s - b_lse[None, :]), 0)
         b_dv += tl.dot(b_p.to(b_do.dtype), b_do)
         b_dp = tl.dot(b_v, tl.trans(b_do))
         b_ds = b_p * (b_dp - b_delta[None, :])
@@ -654,6 +690,8 @@ def parallel_wall_attn_fwd(
     scale: float,
     g_scalar_cumsum: torch.Tensor | None = None,
     window_size: int | None = None,
+    position_ids: torch.Tensor | None = None,
+    position_radius: int | None = None,
     cu_seqlens: torch.LongTensor | None = None,
     chunk_indices: torch.LongTensor | None = None,
 ):
@@ -700,8 +738,9 @@ def parallel_wall_attn_fwd(
         parallel_wall_attn_fwd_kernel.fn[(NV, NT, B * HQ)](
             q=q, k=k, v=v, o=o,
             g_cumsum=g_cumsum, g_scalar_cumsum=g_scalar_cumsum, sink_bias=sink_bias,
+            position_ids=position_ids,
             lse=lse, scale=scale, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
-            B=B, T=T, T_BUCKET=1, W=window_size, H=H, HQ=HQ, G=G, K=K, V=V,
+            B=B, T=T, T_BUCKET=1, W=window_size, R=position_radius, H=H, HQ=HQ, G=G, K=K, V=V,
             BT=BT, BS=BS, BK=BK, BV=BV, num_warps=num_warps, num_stages=num_stages,
         )
         return o, lse
@@ -721,6 +760,7 @@ def parallel_wall_attn_fwd(
         g_cumsum=g_cumsum,
         g_scalar_cumsum=g_scalar_cumsum,
         sink_bias=sink_bias,
+        position_ids=position_ids,
         lse=lse,
         scale=scale,
         cu_seqlens=cu_seqlens,
@@ -729,6 +769,7 @@ def parallel_wall_attn_fwd(
         T=T,
         T_BUCKET=T_BUCKET,
         W=window_size,
+        R=position_radius,
         H=H,
         HQ=HQ,
         G=G,
@@ -774,6 +815,8 @@ def parallel_wall_attn_bwd(
     scale: float | None = None,
     g_scalar_cumsum: torch.Tensor | None = None,
     window_size: int | None = None,
+    position_ids: torch.Tensor | None = None,
+    position_radius: int | None = None,
     cu_seqlens: torch.LongTensor | None = None,
     chunk_indices: torch.LongTensor | None = None,
 ):
@@ -847,12 +890,14 @@ def parallel_wall_attn_bwd(
         dq=dq,
         dg_cumsum=dg_cumsum,
         dg_scalar_cumsum=dg_scalar_cumsum,
+        position_ids=position_ids,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         scale=scale,
         T=T,
         T_BUCKET=T_BUCKET,
         W=window_size,
+        R=position_radius,
         B=B,
         H=H,
         HQ=HQ,
@@ -896,12 +941,14 @@ def parallel_wall_attn_bwd(
         dv=dv,
         dg_cumsum=dg_cumsum_k,
         dg_scalar_cumsum=dg_scalar_cumsum_k,
+        position_ids=position_ids,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         scale=scale,
         T=T,
         T_BUCKET=T_BUCKET,
         W=window_size,
+        R=position_radius,
         B=B,
         H=H,
         HQ=HQ,
@@ -957,6 +1004,8 @@ class WallParallelAttentionFunction(torch.autograd.Function):
         sink_bias,
         scale,
         window_size,
+        position_ids,
+        position_radius,
         cu_seqlens,
         g_scalar=None,
         chunk_indices=None,
@@ -1000,6 +1049,8 @@ class WallParallelAttentionFunction(torch.autograd.Function):
             scale=scale,
             g_scalar_cumsum=c,
             window_size=window_size,
+            position_ids=position_ids,
+            position_radius=position_radius,
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices,
         )
@@ -1009,9 +1060,20 @@ class WallParallelAttentionFunction(torch.autograd.Function):
                 f"lse finite={torch.isfinite(lse).all()}, P abs max={P.abs().max()}"
             )
 
-        ctx.save_for_backward(q, k, v, o, P, lse, sink_bias_scaled, c if c is not None else torch.empty(0))
+        ctx.save_for_backward(
+            q,
+            k,
+            v,
+            o,
+            P,
+            lse,
+            sink_bias_scaled,
+            c if c is not None else torch.empty(0),
+            position_ids,
+        )
         ctx.scale = scale
         ctx.window_size = window_size
+        ctx.position_radius = position_radius
         ctx.cu_seqlens = cu_seqlens
         ctx.has_scalar_g = g_scalar is not None
         ctx.return_lse = return_lse
@@ -1023,7 +1085,7 @@ class WallParallelAttentionFunction(torch.autograd.Function):
     @contiguous
     @autocast_custom_bwd
     def backward(ctx, do, dlse=None):
-        q, k, v, o, P, lse, sink_bias_scaled, c_or_empty = ctx.saved_tensors
+        q, k, v, o, P, lse, sink_bias_scaled, c_or_empty, position_ids = ctx.saved_tensors
         c = c_or_empty if ctx.has_scalar_g else None
 
         if _DEBUG_ASSERTS:
@@ -1042,6 +1104,8 @@ class WallParallelAttentionFunction(torch.autograd.Function):
             scale=ctx.scale,
             g_scalar_cumsum=c,
             window_size=ctx.window_size,
+            position_ids=position_ids,
+            position_radius=ctx.position_radius,
             cu_seqlens=ctx.cu_seqlens,
         )
         if _DEBUG_ASSERTS:
@@ -1067,7 +1131,7 @@ class WallParallelAttentionFunction(torch.autograd.Function):
         else:
             dg_scalar = None
 
-        return dq.to(q), dk.to(k), dv.to(v), dg, dsink_bias, None, None, None, dg_scalar, None, None
+        return dq.to(q), dk.to(k), dv.to(v), dg, dsink_bias, None, None, None, None, None, dg_scalar, None, None
 
 
 def combine_wall_attn_outputs(
@@ -1131,6 +1195,8 @@ def bidirectional_wall_attn(
     sink_bias_future: torch.Tensor | None = None,
     scale: float | None = None,
     window_size: int | None = None,
+    position_ids: torch.Tensor | None = None,
+    position_radius: int | None = None,
     cu_seqlens: torch.LongTensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     r"""Apply paired past/future Wall attention with one shared softmax per head.
@@ -1149,6 +1215,8 @@ def bidirectional_wall_attn(
         sink_bias=sink_bias_past,
         scale=scale,
         window_size=window_size,
+        position_ids=position_ids,
+        position_radius=position_radius,
         cu_seqlens=cu_seqlens,
         return_lse=True,
     )
@@ -1160,6 +1228,7 @@ def bidirectional_wall_attn(
     g_scalar_future_reversed = (
         _reverse_wall_sequences(g_scalar_future, cu_seqlens) if g_scalar_future is not None else None
     )
+    position_ids_future_reversed = position_ids.flip(1) if position_ids is not None else None
     output_future_reversed, lse_future_reversed = parallel_wall_attn(
         q_future_reversed,
         k_future_reversed,
@@ -1169,6 +1238,8 @@ def bidirectional_wall_attn(
         sink_bias=sink_bias_future,
         scale=scale,
         window_size=window_size,
+        position_ids=position_ids_future_reversed,
+        position_radius=position_radius,
         cu_seqlens=cu_seqlens,
         return_lse=True,
     )
@@ -1187,6 +1258,8 @@ def parallel_wall_attn(
     sink_bias: torch.Tensor | None = None,
     scale: float | None = None,
     window_size: int | None = None,
+    position_ids: torch.Tensor | None = None,
+    position_radius: int | None = None,
     cu_seqlens: torch.LongTensor | None = None,
     return_lse: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
@@ -1213,6 +1286,13 @@ def parallel_wall_attn(
             Softmax scale. If `None`, defaults to ``K ** -0.5``. Default: `None`.
         window_size (int, Optional):
             Sliding-window width (causal). Default: `None`.
+        position_ids (torch.Tensor, Optional):
+            Strictly monotonic original positions of shape ``[B, T]`` for an
+            exact position-aware window. Requires ``position_radius`` and is
+            mutually exclusive with ``window_size``. Default: `None`.
+        position_radius (int, Optional):
+            Maximum original-position distance admitted by the causal window.
+            Requires ``position_ids``. Default: `None`.
         cu_seqlens (torch.LongTensor, Optional):
             Cumulative seqlens of shape ``[N + 1]`` for varlen packing
             (requires ``B == 1``). Default: `None`.
@@ -1229,8 +1309,38 @@ def parallel_wall_attn(
         raise ValueError(f"`g_scalar` must be [B, T, HQ] matching q.shape[:-1]; got {g_scalar.shape}")
     if cu_seqlens is not None and q.shape[0] != 1:
         raise ValueError("`cu_seqlens` (varlen) requires batch size 1")
+    if (position_ids is None) != (position_radius is None):
+        raise ValueError("`position_ids` and `position_radius` must be provided together")
+    if position_ids is not None:
+        expected_position_shape = (q.shape[0], q.shape[1])
+        if position_ids.dtype not in {torch.int32, torch.int64}:
+            raise TypeError("`position_ids` must have int32 or int64 dtype")
+        if tuple(position_ids.shape) != expected_position_shape:
+            raise ValueError(
+                f"`position_ids` must have shape {expected_position_shape}; got {tuple(position_ids.shape)}"
+            )
+        if window_size is not None:
+            raise ValueError("`position_ids` and `window_size` are mutually exclusive")
+        if cu_seqlens is not None:
+            raise ValueError("position-aware windows do not support packed variable-length sequences")
+        if position_radius < 0:
+            raise ValueError("`position_radius` must be nonnegative")
+        position_ids = position_ids.contiguous()
+        window_size = position_radius + 1
     if sink_bias is not None and sink_bias.shape != (q.shape[2],):
         raise ValueError(f"`sink_bias` must be [HQ]; got {sink_bias.shape}")
     return WallParallelAttentionFunction.apply(
-        q, k, v, g, sink_bias, scale, window_size, cu_seqlens, g_scalar, None, return_lse
+        q,
+        k,
+        v,
+        g,
+        sink_bias,
+        scale,
+        window_size,
+        position_ids,
+        position_radius,
+        cu_seqlens,
+        g_scalar,
+        None,
+        return_lse,
     )
